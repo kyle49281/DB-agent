@@ -14,7 +14,7 @@ class AgentState(TypedDict):
     # add_messages tells LangGraph to append new messages instead of overwriting
     messages: Annotated[list, add_messages]
 
-os.environ["TAVILY_API_KEY"] = "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"
+os.environ["TAVILY_API_KEY"] = ""
 search_tool = TavilySearch(max_results=2)
 
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
