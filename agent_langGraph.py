@@ -195,6 +195,52 @@ def save_to_history(state: AgentState):
     
     return state # Nodes must return the state
 
+
+def safety_guard(query_to_test: str):
+    # A tiny, fast prompt to check for danger
+    check_prompt = f"Is the following SQL command destructive or does it modify schema? Answer only 'YES' or 'NO': {query_to_test}"
+    response = llm.invoke([HumanMessage(content=check_prompt)])
+    return "YES" in response.content.upper()
+
+# Add this new function/node to your agent_langGraph.py
+def human_review(state: AgentState):
+    """
+    Uses the LLM to semantically judge if a tool call is destructive.
+    """
+    last_message = state["messages"][-1]
+    
+    # If there are no tool calls, just pass through
+    if not last_message.tool_calls:
+        return state
+
+    for tool_call in last_message.tool_calls:
+        # Only audit SQL execution
+        if tool_call["name"] == "execute_sql":
+            query = tool_call["args"]["query"]
+            
+            # Step 1: The 'Semantic' check using the LLM
+            # We ask the LLM to judge the intent of the SQL it just wrote
+            audit_prompt = (
+                f"You are a database security auditor. Analyze this SQL: '{query}'. "
+                "Does this command modify, delete, or create schema/data? "
+                "Answer ONLY 'YES' or 'NO'."
+            )
+            
+            # Call the LLM (llama3.1:8b) to get a judgment
+            judgment = llm.invoke([HumanMessage(content=audit_prompt)]).content.strip().upper()
+            
+            # Step 2: Trigger human intervention if the LLM says 'YES'
+            if "YES" in judgment:
+                print(f"\n--- 🛡️  SEMANTIC GUARDRAIL TRIGGERED ---")
+                print(f"Action detected: {query}")
+                confirm = input("This command modifies the database. Proceed? (yes/no): ").strip().lower()
+                
+                if confirm != 'yes':
+                    # Return a message that redirects the flow back to the agent
+                    return {"messages": [HumanMessage(content="Action blocked by user. Please try a safe alternative.")]}
+    
+    return state
+
 # 4. Build the Graph
 workflow = StateGraph(AgentState)
 
@@ -202,6 +248,7 @@ workflow = StateGraph(AgentState)
 workflow.add_node("agent", call_model)
 workflow.add_node("tools", ToolNode(tools)) # Prebuilt helper for tool execution
 workflow.add_node("saver", save_to_history)
+workflow.add_node("human_review", human_review) # Add the new node
 
 # Define the Flow
 workflow.add_edge(START, "agent")
@@ -212,10 +259,20 @@ workflow.add_conditional_edges(
     "agent", 
     tools_condition,
     {
-        "tools": "tools",  # If tool_calls exist
+        "tools": "human_review",  
         "__end__": "saver" # If no tool_calls, go to saver instead of END
     }
 )
+
+workflow.add_conditional_edges(
+    "human_review",
+    lambda state: "agent" if isinstance(state["messages"][-1], HumanMessage) else "tools",
+    {
+        "agent": "agent",
+        "tools": "tools"
+    }
+)
+
 # After tools run, they MUST go back to the agent to summarize
 workflow.add_edge("tools", "agent")
 workflow.add_edge("saver", END)
@@ -233,7 +290,6 @@ def smart_query(user_input):
         # 'output' is a dict where keys are node names (e.g., 'agent', 'tools')
         for node_name, state_update in output.items():
             print(f"\n[Node: {node_name}]")
-            
             
             # If the agent just spoke, show its thought or tool call
             if node_name == "agent":
@@ -254,9 +310,10 @@ def smart_query(user_input):
     print(final_state["messages"][-1].content)
 
 if __name__ == "__main__":
-    smart_query("list out all table and columns")
+    smart_query("create a new table called 'users'.")
 
 '''
 "create a new table called 'users'."
+"delete a table called 'users'."
 "list out all table and columns"
 '''
