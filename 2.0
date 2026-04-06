@@ -1,0 +1,328 @@
+from typing import Annotated, TypedDict
+import psycopg2
+import os
+from langchain_ollama import ChatOllama
+from langgraph.graph import StateGraph, END, START
+from langgraph.graph.message import add_messages
+from langgraph.prebuilt import ToolNode, tools_condition
+from langchain_tavily import TavilySearch
+from langchain_core.messages import SystemMessage, HumanMessage
+from langchain_core.tools import tool
+from langchain_ollama import OllamaEmbeddings
+# 1. Define the State (The "Whiteboard")
+class AgentState(TypedDict):
+    # add_messages tells LangGraph to append new messages instead of overwriting
+    messages: Annotated[list, add_messages]
+
+os.environ["TAVILY_API_KEY"] = "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"
+search_tool = TavilySearch(max_results=2)
+
+embeddings = OllamaEmbeddings(model="nomic-embed-text")
+
+
+
+@tool
+def list_tables():
+    """Returns a list of all tables in the database so you know what is available."""
+    conn = psycopg2.connect(dbname="ai_lab", user="kyle", host="localhost")
+    cur = conn.cursor()
+    cur.execute("SELECT table_name FROM information_schema.tables WHERE table_schema = 'public'")
+    tables = [row[0] for row in cur.fetchall()]
+    cur.close()
+    conn.close()
+    return f"Available tables: {', '.join(tables)}"
+@tool
+def execute_sql(query: str):
+    """
+    Executes SQL commands against the PostgreSQL 'ai_lab' database.
+    Supports SELECT (reading), CREATE (building), INSERT, and UPDATE.
+    """
+    print(f"🚀 Executing SQL: {query}")
+    try:
+        conn = psycopg2.connect(dbname="ai_lab", user="kyle", host="localhost")
+        
+        # KEY FIX 1: Set autocommit to True so changes are saved immediately
+        conn.autocommit = True 
+        
+        cur = conn.cursor()
+        cur.execute(query)
+        
+        # KEY FIX 2: Only fetch rows if the query actually returns data (like SELECT)
+        if cur.description: 
+            rows = cur.fetchall()
+            result = f"Query Results: {str(rows)}"
+        else:
+            # For CREATE, INSERT, etc., return a success message
+            result = f"Success: Command executed. Rows affected: {cur.rowcount}"
+            
+        cur.close()
+        conn.close()
+        return result
+        
+    except Exception as e:
+        # Safety: ensure connection closes even on failure
+        if 'conn' in locals() and conn:
+            conn.close()
+        return f"❌ SQL Error: {e}. Check your syntax or table names."
+@tool
+def run_math_analysis(code: str):
+    """Executes python code. Define 'result = ...' for the final answer."""
+    print(f"🤓crunching numbers")
+    
+    local_vars = {}
+    try:
+        exec(code, {"__builtins__": __builtins__}, local_vars)
+        return str(local_vars.get('result', "Success"))
+    except Exception as e:
+        return f"Math Error: {e}"
+@tool
+def local_docs_search(query: str):
+    """Use this tool to find technical context, project updates, and manual entries for the Helios project. Check here if the SQL tables are missing details or if you need to explain 'why' a number is the way it is."""
+
+    print(f"🔍 [DB QUERY] Searching for: {query}")
+    
+    try:
+        # 1. Convert the query into a vector
+        query_vector = embeddings.embed_query(query)
+
+        # 2. Connect to Postgres
+        conn = psycopg2.connect(dbname="ai_lab", user="kyle", host="localhost")
+        cur = conn.cursor()
+
+        # 3. Perform Vector Similarity Search (<=> is Cosine Distance)
+        cur.execute("""
+            SELECT content FROM doc_chunks 
+            ORDER BY embedding <=> %s::vector 
+            LIMIT 3;
+        """, (query_vector,))
+        
+        results = cur.fetchall()
+        cur.close()
+        conn.close()
+
+        # 4. Join the results into a single string for the AI to read
+        context = "\n---\n".join([r[0] for r in results])
+        return context if context else "No relevant local documents found."
+        
+    except Exception as e:
+        return f"Database Error: {e}"
+
+@tool
+def discover_database_structure():
+    """
+    Queries the database to find all table names and their column names. 
+    Use this to understand the schema before writing a query.
+    """
+    print(f'looking for all tables and their column names...')
+    conn = psycopg2.connect(dbname="ai_lab", user="kyle", host="localhost")
+    cur = conn.cursor()
+    
+    # This query finds all tables and their columns in the 'public' schema
+    cur.execute("""
+        SELECT table_name, column_name 
+        FROM information_schema.columns 
+        WHERE table_schema = 'public'
+        ORDER BY table_name;
+    """)
+    
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    # Format it into a clean list for the AI
+    schema_info = ""
+    for table, column in rows:
+        schema_info += f"Table: {table} | Column: {column}\n"
+    
+    return schema_info
+
+tools = [
+    search_tool, 
+    local_docs_search, # Vector search
+    list_tables,       # SQL helper 1
+    execute_sql,        # SQL helper 2
+    discover_database_structure
+]
+'''llama3.1:8b'''
+'''qwen2.5:7b'''
+# 2. Setup the LLM and Tools
+llm = ChatOllama(model="qwen2.5:7b", temperature=0).bind_tools(tools)
+clean_llm = ChatOllama(model="qwen2.5:7b", temperature=0)
+
+
+# 3. Define the Nodes
+def call_model(state: AgentState):
+    """The brain: decides what to do next."""
+    prompt = SystemMessage(content=(
+        "You are a strict SQL Data Analyst. "
+        "CRITICAL: If you are unsure of column names, you MUST call 'discover_database_structure' first. "
+        "If a query fails, DO NOT explain why. Just call the tool again with a corrected query. "
+        "Your response MUST be a tool call JSON and NOTHING else until you have the final answer."
+    ))
+    messages = [prompt] + state['messages']
+    response = llm.invoke(messages)
+    return {"messages": [response]}
+
+def save_to_history(state: AgentState):
+    """Saves the final interaction to the database audit log."""
+    last_message = state["messages"][-1].content
+    # Find the original user question (the first message in the list)
+    user_prompt = state["messages"][0].content
+    print(last_message)
+    print(user_prompt)
+    try:
+        conn = psycopg2.connect(dbname="ai_lab", user="kyle", host="localhost")
+        cur = conn.cursor()
+        cur.execute(
+            "INSERT INTO analysis_results (user_prompt, summary) VALUES (%s, %s)", 
+            (user_prompt, last_message)
+        )
+        conn.commit()
+        cur.close()
+        conn.close()
+        print("💾 [System] Interaction logged to analysis_results.")
+    except Exception as e:
+        print(f"⚠️ Logging Error: {e}")
+    
+    return state # Nodes must return the state
+
+
+def safety_guard(query_to_test: str):
+    # A tiny, fast prompt to check for danger
+    check_prompt = f"Is the following SQL command destructive or does it modify schema? Answer only 'YES' or 'NO': {query_to_test}"
+    response = llm.invoke([HumanMessage(content=check_prompt)])
+    return "YES" in response.content.upper()
+
+# Add this new function/node to your agent_langGraph.py
+def human_review(state: AgentState):
+    """
+    Explains the SQL in plain English and asks for user validation.
+    """
+    last_message = state["messages"][-1]
+    
+    if not last_message.tool_calls:
+        return state
+
+    for tool_call in last_message.tool_calls:
+        if tool_call["name"] == "execute_sql":
+            query = tool_call["args"]["query"]
+            
+            # --- 🛡️ EXPLANATION & AUDIT PROMPT ---
+            # We ask the LLM to explain the query AND give a verdict
+            audit_prompt = (
+                f"Analyze this SQL: '{query}'.\n"
+                "1. Explain what this command does in one simple sentence for a non-technical user.\n"
+                "2. Does it modify, delete, or create schema/data? Answer 'VERDICT: YES' or 'VERDICT: NO'.\n"
+                "Format: [Explanation] | VERDICT: [YES/NO]"
+            )
+            
+            # Use clean_llm to avoid tool-call confusion
+            response = clean_llm.invoke([HumanMessage(content=audit_prompt)]).content
+            
+            # Split the explanation from the YES/NO verdict
+            if "|" in response:
+                explanation, verdict = response.split("|")
+            else:
+                explanation, verdict = response, "YES" # Default to safety if format fails
+
+            if "YES" in verdict.upper():
+                print(f"\n--- 🛡️  AGENT EXPLANATION ---")
+                print(f"💡 {explanation.strip()}")
+                print(f"💻 SQL: {query}")
+                
+                user_feedback = input(
+                    "\nProceed? (y/n) or type a change (e.g. 'remove the age column'): "
+                ).strip()
+                
+                if user_feedback.lower() == 'y':
+                    continue 
+                elif user_feedback.lower() == 'n':
+                    return {"messages": [HumanMessage(content="Action cancelled. Please stop.")]}
+                else:
+                    # Send feedback back to the agent to regenerate the SQL
+                    return {"messages": [HumanMessage(content=f"Adjust the query: {user_feedback}")]}
+    
+    return state
+
+# 4. Build the Graph
+workflow = StateGraph(AgentState)
+
+# Add our "Workers"
+workflow.add_node("agent", call_model)
+workflow.add_node("tools", ToolNode(tools)) # Prebuilt helper for tool execution
+workflow.add_node("saver", save_to_history)
+workflow.add_node("human_review", human_review) # Add the new node
+
+# Define the Flow
+workflow.add_edge(START, "agent")
+
+# The Decision: If model wants tools -> go to tools. Otherwise -> END.
+
+workflow.add_conditional_edges(
+    "agent", 
+    tools_condition,
+    {
+        "tools": "human_review",  
+        "__end__": "saver" # If no tool_calls, go to saver instead of END
+    }
+)
+
+workflow.add_conditional_edges(
+    "human_review",
+    lambda state: "agent" if isinstance(state["messages"][-1], HumanMessage) else "tools",
+    {
+        "agent": "agent",
+        "tools": "tools"
+    }
+)
+
+# After tools run, they MUST go back to the agent to summarize
+workflow.add_edge("tools", "agent")
+workflow.add_edge("saver", END)
+# Compile the App
+app = workflow.compile()
+
+
+def smart_query(user_input):
+    inputs = {"messages": [HumanMessage(content=user_input)]}
+    
+    print("--- 🛰️  Agent Link Established ---")
+    
+    # .stream() returns a generator that yields updates after each node
+    for output in app.stream(inputs, config={"recursion_limit": 20}):
+        # 'output' is a dict where keys are node names (e.g., 'agent', 'tools')
+        for node_name, state_update in output.items():
+            print(f"\n[Node: {node_name}]")
+            
+            # If the agent just spoke, show its thought or tool call
+            if node_name == "agent":
+                last_msg = state_update["messages"][-1]
+                if last_msg.tool_calls:
+                    print(f"🛠️  Calling Tools: {[t['name'] for t in last_msg.tool_calls]}")
+                else:
+                    print(f"📝 Finalizing Response...")
+
+            # If the tools just ran, show a snippet of what they found
+            elif node_name == "tools":
+                print("📋 Data retrieved from Database/Web.")
+
+    # After the loop finishes, print the final result from the state
+    # (The state is preserved in the last 'output')
+    final_state = list(output.values())[0] 
+    print("\n✅ FINAL ANSWER:")
+    print(final_state["messages"][-1].content)
+
+if __name__ == "__main__":
+    smart_query("find the user: kyle in my database")
+
+'''
+"create a new table called 'users'."
+"delete a table called 'users'."
+"add a user name kyle with email'kyle49281@gmail.com' id'1' to table users"
+"list out all table and columns"
+"what is the info in my table:users"
+"find the user: kyle in my database"
+"what is in my table 'users'"
+"find the user name kyle"
+"create a new table called 'users', and add key 'names', 'id', 'email'."
+'''
