@@ -14,13 +14,15 @@ class AgentState(TypedDict):
     # add_messages tells LangGraph to append new messages instead of overwriting
     messages: Annotated[list, add_messages]
 
-os.environ["TAVILY_API_KEY"] = ""
+os.environ["TAVILY_API_KEY"] = "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"
 search_tool = TavilySearch(max_results=2)
 
 embeddings = OllamaEmbeddings(model="nomic-embed-text")
 
 system_prompt = (
-    "You are a Senior Data Analyst. DO NOT explain your process. "
+    
+    "You are a data analyst.DO NOT explain your process.\n "
+    "If you are unsure which table to use or how columns are named, call the discover_database_structure tool first. Then, use execute_sql to answer the user.\n"
     "When asked about data, follow this strict SEARCH PROTOCOL:\n"
     "1. FIRST: Use 'list_tables' and 'execute_sql' to find structured data (like efficiency ratings or costs).\n"
     "2. SECOND: If the answer isn't in a table, use 'local_docs_search' to check kyle's notes.\n"
@@ -43,20 +45,36 @@ def list_tables():
 @tool
 def execute_sql(query: str):
     """
-    Executes a SQL query against the PostgreSQL 'ai_lab' database.
-    Use this to count records, find specific IDs, or analyze analysis_results.
+    Executes SQL commands against the PostgreSQL 'ai_lab' database.
+    Supports SELECT (reading), CREATE (building), INSERT, and UPDATE.
     """
-    print("querying DB...")
+    print(f"🚀 Executing SQL: {query}")
     try:
         conn = psycopg2.connect(dbname="ai_lab", user="kyle", host="localhost")
+        
+        # KEY FIX 1: Set autocommit to True so changes are saved immediately
+        conn.autocommit = True 
+        
         cur = conn.cursor()
         cur.execute(query)
-        rows = cur.fetchall()
+        
+        # KEY FIX 2: Only fetch rows if the query actually returns data (like SELECT)
+        if cur.description: 
+            rows = cur.fetchall()
+            result = f"Query Results: {str(rows)}"
+        else:
+            # For CREATE, INSERT, etc., return a success message
+            result = f"Success: Command executed. Rows affected: {cur.rowcount}"
+            
         cur.close()
         conn.close()
-        return str(rows)
+        return result
+        
     except Exception as e:
-        return f"SQL Error: {e}. Check your syntax and table names."
+        # Safety: ensure connection closes even on failure
+        if 'conn' in locals() and conn:
+            conn.close()
+        return f"❌ SQL Error: {e}. Check your syntax or table names."
 @tool
 def run_math_analysis(code: str):
     """Executes python code. Define 'result = ...' for the final answer."""
@@ -100,11 +118,41 @@ def local_docs_search(query: str):
     except Exception as e:
         return f"Database Error: {e}"
 
+@tool
+def discover_database_structure():
+    """
+    Queries the database to find all table names and their column names. 
+    Use this to understand the schema before writing a query.
+    """
+    print(f'looking for all tables and their column names...')
+    conn = psycopg2.connect(dbname="ai_lab", user="kyle", host="localhost")
+    cur = conn.cursor()
+    
+    # This query finds all tables and their columns in the 'public' schema
+    cur.execute("""
+        SELECT table_name, column_name 
+        FROM information_schema.columns 
+        WHERE table_schema = 'public'
+        ORDER BY table_name;
+    """)
+    
+    rows = cur.fetchall()
+    cur.close()
+    conn.close()
+
+    # Format it into a clean list for the AI
+    schema_info = ""
+    for table, column in rows:
+        schema_info += f"Table: {table} | Column: {column}\n"
+    
+    return schema_info
+
 tools = [
     search_tool, 
     local_docs_search, # Vector search
     list_tables,       # SQL helper 1
-    execute_sql        # SQL helper 2
+    execute_sql,        # SQL helper 2
+    discover_database_structure
 ]
 
 # 2. Setup the LLM and Tools
@@ -114,12 +162,11 @@ llm = ChatOllama(model="llama3.1:8b", temperature=0).bind_tools(tools)
 def call_model(state: AgentState):
     """The brain: decides what to do next."""
     prompt = SystemMessage(content=(
-        "You are a Senior Data Analyst. "
-        "SEARCH PROTOCOL:\n"
-        "1. Check 'list_tables' and 'execute_sql' for numbers/ratings.\n"
-        "2. Check 'local_docs_search' for context/notes.\n"
-        "3. Check 'web_search' for newest benchmarks.\n"
-        "Always provide a bulleted list summary."
+        "You are a strict SQL Data Analyst. "
+        "When you need a tool, you MUST call it directly. "
+        "DO NOT write any conversational text, explanations, or 'I will use...' sentences. "
+        "Your response should ONLY be the tool call. "
+        "Only after you receive the tool's output should you provide a final summary."
     ))
     messages = [prompt] + state['messages']
     response = llm.invoke(messages)
@@ -187,6 +234,7 @@ def smart_query(user_input):
         for node_name, state_update in output.items():
             print(f"\n[Node: {node_name}]")
             
+            
             # If the agent just spoke, show its thought or tool call
             if node_name == "agent":
                 last_msg = state_update["messages"][-1]
@@ -206,4 +254,9 @@ def smart_query(user_input):
     print(final_state["messages"][-1].content)
 
 if __name__ == "__main__":
-    smart_query("What is the best efficiency_rating of my solar inventory?")
+    smart_query("list out all table and columns")
+
+'''
+"create a new table called 'users'."
+"list out all table and columns"
+'''
